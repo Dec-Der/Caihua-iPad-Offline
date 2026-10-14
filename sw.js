@@ -1,4 +1,4 @@
-const CACHE='caihua-offline-1-45-cloud-v1';
+const CACHE='caihua-offline-1-45-cloud-smooth-v2';
 const ASSETS=['./','./index.html','./app.js','./cloud.js','./jszip.min.js','./manifest.webmanifest','./icon.svg'];
 self.addEventListener('install',e=>e.waitUntil(caches.open(CACHE).then(c=>c.addAll(ASSETS)).then(()=>self.skipWaiting())));
 self.addEventListener('activate',e=>e.waitUntil((async()=>{for(const key of await caches.keys()) if(key.startsWith('caihua-offline-')&&key!==CACHE)await caches.delete(key);await self.clients.claim()})()));

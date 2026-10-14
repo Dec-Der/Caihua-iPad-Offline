@@ -1,6 +1,6 @@
-/* Caihua iPad Offline annotator v1.0: private photos + stroke JSON live in iPad IndexedDB.
-   The pressure geometry matches upstream PressureRibbon._sceneFunc (MIT? upstream AGPL) using
-   1–45 image px: radius = 0.5 + 22*pressure. No online API calls. */
+/* Caihua iPad Offline annotator v1.2 Smooth: private photos + stroke JSON live in iPad IndexedDB.
+   Legacy strokes retain upstream ribbon geometry; new strokes use versioned round-dabs-v2.
+   1–45 image px: radius = 0.5 + 22*filtered_pressure. */
 'use strict';
 const $ = id => document.getElementById(id);
 const WIDTH_BASE=.5, WIDTH_SCALE=22, DB_NAME='caihua-ipad-offline-v1';
@@ -26,24 +26,117 @@ function fit(){if(!state.image)return;const r=$('view').getBoundingClientRect();
 function resized(){const toolbar=document.querySelector('.toolbar');$('view').style.top=Math.ceil(toolbar.getBoundingClientRect().height)+'px';const canvas=$('paint'),rect=$('view').getBoundingClientRect(),dpr=Math.min(window.devicePixelRatio||1,2.5);canvas.width=Math.max(1,Math.round(rect.width*dpr));canvas.height=Math.max(1,Math.round(rect.height*dpr));canvas.style.width=rect.width+'px';canvas.style.height=rect.height+'px';if(state.image)draw()}
 function pt(e){const r=$('paint').getBoundingClientRect();return {x:(e.clientX-r.left-state.offsetX)/state.zoom,y:(e.clientY-r.top-state.offsetY)/state.zoom}}
 function screenPt(e){const r=$('paint').getBoundingClientRect();return {x:e.clientX-r.left,y:e.clientY-r.top}}
-function pressure(e){return Number.isFinite(e.pressure)&&e.pressure>0?Math.min(1,e.pressure):.5}
+// Keep legacy renderer unchanged for annotations made before this upgrade.
 function drawRibbon(ctx,pts){if(!pts||!pts.length)return;ctx.beginPath();const r=p=>WIDTH_BASE+WIDTH_SCALE*Math.max(0,Math.min(1,p[2]??.5));if(pts.length===1){ctx.arc(pts[0][0],pts[0][1],r(pts[0]),0,Math.PI*2);ctx.fill();return}const left=[],right=[];for(let i=0;i<pts.length;i++){const [x,y]=pts[i];let dx,dy;if(i===0){dx=pts[1][0]-x;dy=pts[1][1]-y}else if(i===pts.length-1){dx=x-pts[i-1][0];dy=y-pts[i-1][1]}else{dx=pts[i+1][0]-pts[i-1][0];dy=pts[i+1][1]-pts[i-1][1]}const len=Math.hypot(dx,dy)||1,nx=-dy/len,ny=dx/len,rad=r(pts[i]);left.push([x+nx*rad,y+ny*rad]);right.push([x-nx*rad,y-ny*rad])}const a=(center,p)=>Math.atan2(p[1]-center[1],p[0]-center[0]);ctx.arc(pts[0][0],pts[0][1],r(pts[0]),a(pts[0],left[0]),a(pts[0],right[0]),true);for(const p of left)ctx.lineTo(p[0],p[1]);const last=pts.length-1;ctx.arc(pts[last][0],pts[last][1],r(pts[last]),a(pts[last],right[last]),a(pts[last],left[last]),false);for(let i=last;i>=0;i--)ctx.lineTo(right[i][0],right[i][1]);ctx.closePath();ctx.fill()}
-function draw(){const canvas=$('paint');if(!canvas.width)return;const dpr=canvas.width/Math.max(1,canvas.getBoundingClientRect().width),ctx=canvas.getContext('2d');ctx.setTransform(1,0,0,1,0,0);ctx.clearRect(0,0,canvas.width,canvas.height);if(!state.image)return;ctx.setTransform(dpr*state.zoom,0,0,dpr*state.zoom,dpr*state.offsetX,dpr*state.offsetY);ctx.drawImage(state.image,0,0);ctx.fillStyle='rgba(255,44,44,0.90)';for(const s of state.doc?.strokes||[])drawRibbon(ctx,s.pts);if(state.active)drawRibbon(ctx,state.active.pts);$('info').textContent=`${state.doc?.strokes?.length||0} 笔 · ${(state.zoom*100).toFixed(1)}% · 压感宽度 1–45 原图像素`}
+// Draw a union of round dabs, not a self-intersecting offset polygon. Image-pixel
+// spacing and pressure interpolation MUST match the Mac round-dabs-v2 exporter.
+const SMOOTH_RENDERER='round-dabs-v2';
+const PRESSURE_SMOOTH_DISTANCE=5; // original image px; damping isolated spikes
+function samplePressure(e,fallback=.5){return Number.isFinite(e.pressure)&&e.pressure>0&&e.pressure<=1?e.pressure:fallback}
+function roundDabs(pts,cb){
+  if(!pts?.length)return;
+  const rad=p=>WIDTH_BASE+WIDTH_SCALE*Math.max(0,Math.min(1,p[2]??.5));
+  let prev=pts[0],r0=rad(prev);cb(prev[0],prev[1],r0);
+  for(let i=1;i<pts.length;i++){
+    const next=pts[i],r1=rad(next),dx=next[0]-prev[0],dy=next[1]-prev[1],dist=Math.hypot(dx,dy);
+    if(!Number.isFinite(dist)||!Number.isFinite(r1))continue;
+    // Small radii need closer centers to avoid broken 1 px hairline cracks.
+    const maxStep=Math.min(1.5,Math.max(.4,Math.min(r0,r1)*.8));
+    const steps=Math.max(1,Math.ceil(dist/maxStep),Math.ceil(Math.abs(r1-r0)/.35));
+    if(steps>100000)throw new Error('笔画坐标异常，请撤销并重新绘制');
+    for(let k=1;k<=steps;k++){
+      const t=k/steps;cb(prev[0]+dx*t,prev[1]+dy*t,r0+(r1-r0)*t);
+    }
+    prev=next;r0=r1;
+  }
+}
+function drawRoundDabs(ctx,pts){
+  if(!pts?.length)return;
+  ctx.beginPath();
+  roundDabs(pts,(x,y,r)=>{ctx.moveTo(x+r,y);ctx.arc(x,y,r,0,2*Math.PI,false)});
+  ctx.fill();
+}
+function drawStroke(ctx,s){
+  if(s.renderer===SMOOTH_RENDERER)drawRoundDabs(ctx,s.pts);
+  else drawRibbon(ctx,s.pts);
+}
+// Spatial low-pass on pressure, NOT fixed-width painting. Avoid a 0-pressure
+// pointer sample at lift-off being converted to 0.5 and forming a fat blob.
+function addPenSample(s,ev){
+  if(s.pointerId!==ev.pointerId&&typeof ev.pointerId==='number')return;
+  const p=pt(ev),pts=s.pts,prev=pts[pts.length-1];
+  if(!Number.isFinite(p.x)||!Number.isFinite(p.y))return;
+  const d=Math.hypot(p.x-prev[0],p.y-prev[1]);
+  if(pts.length===1&&s.firstWasMissingPressure&&ev.pressure>0&&ev.pressure<=1){
+    pts[0][2]=ev.pressure;s.firstWasMissingPressure=false;
+  }
+  // Ignore sub-pixel sampling jitter, but retain genuine travel.
+  if(d<Math.max(.25,.25/Math.max(.2,state.zoom)))return;
+  const raw=samplePressure(ev,prev[2]);
+  const alpha=1-Math.exp(-d/PRESSURE_SMOOTH_DISTANCE);
+  const wanted=prev[2]+(raw-prev[2])*alpha;
+  // A narrow spike in a sample cannot increase width by dozens of pixels.
+  const maxDelta=Math.max(.005,(1.6*d)/(2*WIDTH_SCALE));
+  const nextP=Math.max(0,Math.min(1,prev[2]+Math.max(-maxDelta,Math.min(maxDelta,wanted-prev[2]))));
+  pts.push([p.x,p.y,nextP]);
+}
+function draw(){const canvas=$('paint');if(!canvas.width)return;const dpr=canvas.width/Math.max(1,canvas.getBoundingClientRect().width),ctx=canvas.getContext('2d');ctx.setTransform(1,0,0,1,0,0);ctx.clearRect(0,0,canvas.width,canvas.height);if(!state.image)return;ctx.setTransform(dpr*state.zoom,0,0,dpr*state.zoom,dpr*state.offsetX,dpr*state.offsetY);ctx.drawImage(state.image,0,0);ctx.fillStyle='rgba(255,44,44,0.90)';for(const s of state.doc?.strokes||[])drawStroke(ctx,s);if(state.active)drawStroke(ctx,state.active);$('info').textContent=`${state.doc?.strokes?.length||0} 笔 · ${(state.zoom*100).toFixed(1)}% · 压感 1–45 px · 平滑版 V1.2`}
 function queueUndo(){state.undo.push(JSON.stringify({strokes:state.doc.strokes,status:state.doc.status}));if(state.undo.length>100)state.undo.shift();state.redo=[]}
 async function save(){if(!state.name||!state.doc)return true;state.saving=true;setStatus('正在保存到 iPad…');try{const doc={...state.doc,updated:new Date().toISOString()};await dbPut('docs',doc);state.doc=doc;const rec=state.queue.find(x=>x.name===state.name);rec.status=doc.status;await dbPut('records',rec);state.dirty=false;setStatus('✓ 已保存到 iPad 本地');renderQueue();return true}catch(e){setStatus('✕ 本地保存失败');alert('本地保存失败，请不要关闭页面：'+e.message);return false}finally{state.saving=false}}
 async function commitChange(){state.dirty=true;draw();await save()}
 function nearestStroke(p){const strokes=state.doc?.strokes||[];for(let i=strokes.length-1;i>=0;i--){const pts=strokes[i].pts;for(let j=0;j<pts.length;j++){const q=pts[j],rad=WIDTH_BASE+WIDTH_SCALE*(q[2]??.5)+Math.max(4,8/state.zoom);if(Math.hypot(p.x-q[0],p.y-q[1])<rad)return i}}return -1}
 function touchDistance(){const xs=[...state.touches.values()];if(xs.length!==2)return null;return {cx:(xs[0].x+xs[1].x)/2,cy:(xs[0].y+xs[1].y)/2,dist:Math.hypot(xs[0].x-xs[1].x,xs[0].y-xs[1].y)}}
 function zoomAt(f,cx,cy){const z=Math.max(.05,Math.min(10,state.zoom*f)),factor=z/state.zoom;state.offsetX=cx-(cx-state.offsetX)*factor;state.offsetY=cy-(cy-state.offsetY)*factor;state.zoom=z;draw()}
-function pointerDown(e){if(!state.image||state.saving)return;const canvas=$('paint');canvas.setPointerCapture(e.pointerId);if(e.pointerType==='touch'){state.touches.set(e.pointerId,screenPt(e));if(state.touches.size===2)state.pinch=touchDistance();return}if(state.active)return;if(state.tool==='erase'){const n=nearestStroke(pt(e));if(n>=0){queueUndo();state.doc.strokes.splice(n,1);state.doc.status=state.doc.strokes.length?'annotated':'pending';commitChange()}return}const p=pt(e);state.active={id:'mask_'+Date.now().toString(36)+'_'+Math.floor(Math.random()*1e5),pts:[[p.x,p.y,pressure(e)]]};draw();e.preventDefault()}
-function pointerMove(e){if(e.pointerType==='touch'){if(!state.touches.has(e.pointerId))return;const old=state.touches.get(e.pointerId),now=screenPt(e);state.touches.set(e.pointerId,now);if(state.touches.size===2){const nowPinch=touchDistance();if(state.pinch&&nowPinch){const anchor={x:state.pinch.cx,y:state.pinch.cy};zoomAt(nowPinch.dist/state.pinch.dist,anchor.x,anchor.y);state.offsetX+=nowPinch.cx-state.pinch.cx;state.offsetY+=nowPinch.cy-state.pinch.cy}state.pinch=nowPinch}else{state.offsetX+=now.x-old.x;state.offsetY+=now.y-old.y;draw()}return}if(!state.active)return;const events=typeof e.getCoalescedEvents==='function'&&e.getCoalescedEvents().length?e.getCoalescedEvents():[e];for(const ev of events){const p=pt(ev);const pts=state.active.pts;const prev=pts[pts.length-1];if(Math.hypot(p.x-prev[0],p.y-prev[1])>.03||Math.abs(pressure(ev)-prev[2])>.005)pts.push([p.x,p.y,pressure(ev)])}draw();e.preventDefault()}
-async function pointerUp(e){if(e.pointerType==='touch'){state.touches.delete(e.pointerId);state.pinch=touchDistance();return}if(!state.active)return;const stroke=state.active;state.active=null;if(stroke.pts.length===1){const p=stroke.pts[0];stroke.pts.push([p[0]+.001,p[1]+.001,p[2]])}queueUndo();state.doc.strokes.push(stroke);state.doc.status='annotated';await commitChange()}
+function pointerDown(e){
+  if(!state.image||state.saving)return;
+  const canvas=$('paint');
+  if(e.pointerType==='touch'){
+    canvas.setPointerCapture(e.pointerId);state.touches.set(e.pointerId,screenPt(e));
+    if(state.touches.size===2)state.pinch=touchDistance();return;
+  }
+  if(state.active)return;
+  canvas.setPointerCapture(e.pointerId);
+  if(state.tool==='erase'){
+    const n=nearestStroke(pt(e));if(n>=0){queueUndo();state.doc.strokes.splice(n,1);state.doc.status=state.doc.strokes.length?'annotated':'pending';commitChange()}return;
+  }
+  const p=pt(e);
+  state.active={id:'mask_'+Date.now().toString(36)+'_'+Math.floor(Math.random()*1e5),
+    renderer:SMOOTH_RENDERER,pointerId:e.pointerId,
+    firstWasMissingPressure:!(e.pressure>0&&e.pressure<=1),
+    pts:[[p.x,p.y,samplePressure(e)]]};
+  draw();e.preventDefault();
+}
+let paintingFrame=0;
+function queuePaint(){if(paintingFrame)return;paintingFrame=requestAnimationFrame(()=>{paintingFrame=0;draw()})}
+function pointerMove(e){
+  if(e.pointerType==='touch'){
+    if(!state.touches.has(e.pointerId))return;
+    const old=state.touches.get(e.pointerId),now=screenPt(e);state.touches.set(e.pointerId,now);
+    if(state.touches.size===2){const nowPinch=touchDistance();if(state.pinch&&nowPinch){const anchor={x:state.pinch.cx,y:state.pinch.cy};zoomAt(nowPinch.dist/state.pinch.dist,anchor.x,anchor.y);state.offsetX+=nowPinch.cx-state.pinch.cx;state.offsetY+=nowPinch.cy-state.pinch.cy}state.pinch=nowPinch}
+    else{state.offsetX+=now.x-old.x;state.offsetY+=now.y-old.y;queuePaint()}
+    return;
+  }
+  if(!state.active||state.active.pointerId!==e.pointerId)return;
+  const collected=typeof e.getCoalescedEvents==='function'?e.getCoalescedEvents():[];
+  const events=collected&&collected.length?collected:[e];
+  for(const ev of events)addPenSample(state.active,ev);
+  queuePaint();e.preventDefault();
+}
+async function pointerUp(e){
+  if(e.pointerType==='touch'){state.touches.delete(e.pointerId);state.pinch=touchDistance();return}
+  if(!state.active||state.active.pointerId!==e.pointerId)return;
+  const stroke=state.active;state.active=null;
+  // Do NOT use pointerup pressure (often zero). A tap becomes a 1px-distance dot.
+  if(stroke.pts.length===1){const p=stroke.pts[0];stroke.pts.push([p[0]+.001,p[1]+.001,p[2]])}
+  delete stroke.pointerId;delete stroke.firstWasMissingPressure;
+  queueUndo();state.doc.strokes.push(stroke);state.doc.status='annotated';await commitChange();
+}
 async function setUndo(redo=false){if(state.saving||!state.doc)return;const source=redo?state.redo:state.undo,target=redo?state.undo:state.redo;if(!source.length)return;target.push(JSON.stringify({strokes:state.doc.strokes,status:state.doc.status}));Object.assign(state.doc,JSON.parse(source.pop()));await commitChange()}
 function setTool(t){state.tool=t;$('brush').classList.toggle('active',t==='brush');$('erase').classList.toggle('active',t==='erase')}
 async function negative(){if(!state.doc||state.saving)return;if(state.doc.strokes.length&&!confirm('当前照片存在裂隙笔画，确认无裂隙将清空它们。是否继续？'))return;queueUndo();state.doc.strokes=[];state.doc.status=state.doc.status==='negative'?'pending':'negative';await commitChange()}
 async function navigate(delta){const i=state.queue.findIndex(x=>x.name===state.name);if(i<0)return;const n=i+delta;if(n>=0&&n<state.queue.length)await go(state.queue[n].name)}
-function backupDoc(rec,doc){const stems=rec.name.replace(/\.[^.]+$/,'');return {image_id:stems,width:rec.width,height:rec.height,annotator:'ipad_offline',status:doc.status==='annotated'?'annotated':'pending',updated:doc.updated||new Date().toISOString(),boxes:[],masks:doc.strokes.map(s=>({id:s.id,class_id:1,type:'brush',points:s.pts}))}}
-async function backup(){if(state.busy||state.saving)return;state.busy=true;try{if(state.dirty&&!(await save()))return;setStatus('正在生成标注备份…');const zip=new JSZip();const metadata=[];let annotated=0,negative=0;for(const rec of state.queue){const doc=await dbGet('docs',rec.name)||blankDoc(rec.name);metadata.push({name:rec.name,width:rec.width,height:rec.height,bytes:rec.bytes,sha256:rec.sha256,status:doc.status,stroke_count:doc.strokes.length,updated:doc.updated});if(doc.status==='annotated'){zip.file('annotations/'+rec.name.replace(/\.[^.]+$/,'')+'.json',JSON.stringify(backupDoc(rec,doc),null,2));annotated++}if(doc.status==='negative')negative++}const manifest={format:'caihua-ipad-offline-v1',created:new Date().toISOString(),brush:{min_width:1,max_width:45,base_radius:WIDTH_BASE,pressure_scale:WIDTH_SCALE},images:metadata};zip.file('offline_manifest.json',JSON.stringify(manifest,null,2));zip.file('READ_ME.txt','仅包含标注JSON，不含原照片；先在Mac项目导入同名原照片，再执行 offline_to_ml_app.py。\n已确认无裂隙的照片记录于 offline_manifest.json。\n');const blob=await zip.generateAsync({type:'blob',compression:'DEFLATE',compressionOptions:{level:6}});const name=`caihua_offline_backup_${new Date().toISOString().replace(/[:.]/g,'-')}.zip`;state.latestBackup={blob,name};$('shareBackup').disabled=false;setStatus(`备份已生成：${annotated} 张有裂隙、${negative} 张无裂隙`);alert(`备份 ZIP 已在页面内生成：${name}\n\n现在请点击顶部【保存 / 分享备份】，使用系统分享存入 iPad “文件”或 AirDrop 给 Mac。\n\n在“文件”中确认 ZIP 实际存在之前，不能认为备份已经成功！`);}catch(e){alert('备份未完成，请重试：'+e.message)}finally{state.busy=false}}
+function backupDoc(rec,doc){const stems=rec.name.replace(/\.[^.]+$/,'');return {image_id:stems,width:rec.width,height:rec.height,annotator:'ipad_offline',status:doc.status==='annotated'?'annotated':'pending',updated:doc.updated||new Date().toISOString(),boxes:[],masks:doc.strokes.map(s=>({id:s.id,class_id:1,type:'brush',points:s.pts,...(s.renderer===SMOOTH_RENDERER?{renderer:SMOOTH_RENDERER}:{})}))}}
+async function backup(){if(state.busy||state.saving)return;state.busy=true;try{if(state.dirty&&!(await save()))return;setStatus('正在生成标注备份…');const zip=new JSZip();const metadata=[];let annotated=0,negative=0;for(const rec of state.queue){const doc=await dbGet('docs',rec.name)||blankDoc(rec.name);metadata.push({name:rec.name,width:rec.width,height:rec.height,bytes:rec.bytes,sha256:rec.sha256,status:doc.status,stroke_count:doc.strokes.length,updated:doc.updated});if(doc.status==='annotated'){zip.file('annotations/'+rec.name.replace(/\.[^.]+$/,'')+'.json',JSON.stringify(backupDoc(rec,doc),null,2));annotated++}if(doc.status==='negative')negative++}const manifest={format:'caihua-ipad-offline-v1',created:new Date().toISOString(),brush:{min_width:1,max_width:45,base_radius:WIDTH_BASE,pressure_scale:WIDTH_SCALE,version:'smooth-v1.2',new_stroke_renderer:SMOOTH_RENDERER},images:metadata};zip.file('offline_manifest.json',JSON.stringify(manifest,null,2));zip.file('READ_ME.txt','仅包含标注JSON，不含原照片；先在Mac项目导入同名原照片，再执行 offline_to_ml_app.py。\n已确认无裂隙的照片记录于 offline_manifest.json。\n');const blob=await zip.generateAsync({type:'blob',compression:'DEFLATE',compressionOptions:{level:6}});const name=`caihua_offline_backup_${new Date().toISOString().replace(/[:.]/g,'-')}.zip`;state.latestBackup={blob,name};$('shareBackup').disabled=false;setStatus(`备份已生成：${annotated} 张有裂隙、${negative} 张无裂隙`);alert(`备份 ZIP 已在页面内生成：${name}\n\n现在请点击顶部【保存 / 分享备份】，使用系统分享存入 iPad “文件”或 AirDrop 给 Mac。\n\n在“文件”中确认 ZIP 实际存在之前，不能认为备份已经成功！`);}catch(e){alert('备份未完成，请重试：'+e.message)}finally{state.busy=false}}
 async function shareBackup(){const latest=state.latestBackup;if(!latest){alert('请先生成备份 ZIP');return}const {blob,name}=latest;const file=new File([blob],name,{type:'application/zip'});if(navigator.share&&(!navigator.canShare||navigator.canShare({files:[file]}))){try{await navigator.share({files:[file],title:'彩画裂隙离线标注备份'});note('已打开系统分享。请确认已将 ZIP 实际保存到文件或Mac。',9000);return}catch(e){if(e.name==='AbortError')return;note('系统分享不可用，尝试下载…',6000)}}const url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download=name;document.body.appendChild(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),90000);alert('已触发浏览器下载。请打开“文件”App核实 ZIP 是否实际保存；若没有，请从 Safari 打开该网页再试。')}
 async function init(){try{if(navigator.storage?.persist)navigator.storage.persist().catch(()=>{});state.db=await idb();await loadQueue();resized();setStatus('本地数据库已就绪');if('serviceWorker'in navigator){try{await navigator.serviceWorker.register('./sw.js',{scope:'./'});await navigator.serviceWorker.ready;setStatus('✓ 离线程序已就绪')}catch(e){setStatus('⚠ 未启用离线启动；请使用 HTTPS 安装');note('离线启动未就绪：'+e.message,10000)}}else note('此环境不支持离线 Service Worker，请用 iPad Safari 的 HTTPS 网页安装',9000);if(state.queue.length)await go(state.queue[0].name);await storageWarning()}catch(e){alert('初始化失败：'+e.message);setStatus('初始化错误')}
 if(window.CaihuaCloud)window.CaihuaCloud.init();
