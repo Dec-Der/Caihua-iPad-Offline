@@ -1,4 +1,4 @@
-/* Caihua Cloud Photo Sync v1.1 — ONLY images synchronize; annotations stay in device IndexedDB.
+/* Caihua Cloud Photo Sync v1.3.1 (Safari login resilience + safe diagnostics) — ONLY images synchronize; annotations stay in device IndexedDB.
    Supabase Auth password + private Storage bucket + per-user row-level access. No secret/service key. */
 'use strict';
 (()=>{
@@ -18,8 +18,74 @@ function validateSettings(s){
 }
 const jsonHeaders=()=>({'apikey':settings.key,'Content-Type':'application/json'});
 function errorFromPayload(obj,status){return new Error(`${obj?.msg||obj?.message||obj?.error_description||obj?.error||`HTTP ${status}`}`)}
-async function authToken(grant,body){const r=await fetch(`${settings.url}/auth/v1/token?grant_type=${grant}`,{method:'POST',headers:jsonHeaders(),body:JSON.stringify(body),cache:'no-store'});const obj=await r.json().catch(()=>({}));if(!r.ok)throw errorFromPayload(obj,r.status);if(!obj.access_token||!obj.refresh_token||!obj.user?.id)throw Error('无法取得完整认证信息，请重新登录');session={access_token:obj.access_token,refresh_token:obj.refresh_token,user:obj.user,expires_at:Date.now()+(obj.expires_in||3600)*1000};localStorage.setItem(SESSION_KEY,JSON.stringify(session));renderLogin();return session}
-async function getSession(){if(!settings)throw Error('请先配置云照片库');if(!session)throw Error('请先登录云照片库');if(Date.now()>session.expires_at-90_000){try{await authToken('refresh_token',{refresh_token:session.refresh_token})}catch(err){session=null;localStorage.removeItem(SESSION_KEY);renderLogin();throw Error('登录已过期，请重新登录：'+err.message)}}return session}
+// Safari sometimes aborts fetch before an HTTP response is available. Retry ONLY
+// transport errors. Never retry rejected credentials (HTTP 400/401).
+function isNetworkFailure(err){return err?.name==='AbortError'||/load failed|failed to fetch|networkerror|network request failed|请求超时|网络请求未完成|网络连接失败/i.test(String(err?.message||err))||err instanceof TypeError}
+function delay(ms){return new Promise(resolve=>setTimeout(resolve,ms))}
+async function timedFetch(url,opts={},timeoutMs=16000){
+  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),timeoutMs);
+  try{return await fetch(url,{...opts,signal:controller.signal})}finally{clearTimeout(timer)}
+}
+async function retryingFetch(url,opts,label){
+  for(let attempt=1;attempt<=3;attempt++){
+    try{return await timedFetch(url,opts)}
+    catch(e){
+      if(!isNetworkFailure(e))throw e;
+      if(attempt===3)throw Error(`${label}网络请求未完成（${e.message||e.name}）。请点击「诊断连接」，并检查网络、DNS、Safari 内容拦截或跨域预检。`);
+      display(`${label}网络暂时失败，正在重试 ${attempt}/2…`);
+      await delay(attempt===1?800:1800);
+    }
+  }
+}
+async function authToken(grant,body){
+  const r=await retryingFetch(`${settings.url}/auth/v1/token?grant_type=${grant}`,{
+    method:'POST',headers:jsonHeaders(),body:JSON.stringify(body),cache:'no-store'
+  },grant==='refresh_token'?'续期':'登录');
+  const obj=await r.json().catch(()=>({}));
+  if(!r.ok)throw errorFromPayload(obj,r.status);
+  if(!obj.access_token||!obj.refresh_token||!obj.user?.id)throw Error('无法取得完整认证信息，请重新登录');
+  session={access_token:obj.access_token,refresh_token:obj.refresh_token,user:obj.user,expires_at:Date.now()+(obj.expires_in||3600)*1000};
+  localStorage.setItem(SESSION_KEY,JSON.stringify(session));renderLogin();return session;
+}
+// Safe diagnosis never transmits passwords or access tokens, and never logs keys.
+async function diagnoseConnection(){
+  const out=['云照片库连接诊断 V1.3.1'];
+  try{
+    const s=validateSettings({url:$('cloudUrl').value,key:$('cloudKey').value});
+    out.push('平台：'+location.origin,'云端主机：'+new URL(s.url).host,'设备在线状态：'+(navigator.onLine?'显示在线':'显示离线'));
+    const base=s.url+'/auth/v1/health';
+    const test=async(label,headers)=>{
+      try{
+        const r=await timedFetch(base+'?check='+Date.now(),{method:'GET',headers,cache:'no-store'},12000);
+        out.push(`${label}：可收到 HTTP ${r.status}`);return true;
+      }catch(e){out.push(`${label}：请求失败（${e?.name||'Error'}：${e?.message||'未知错误'}）`);return false}
+    };
+    const direct=await test('① 基础跨域 GET（不附加密钥）',{});
+    const keyed=await test('② 带 apikey 的 GET（触发预检）',{'apikey':s.key});
+    if(!direct&&!keyed)out.push('判断：iPad 浏览器跨域请求受阻；优先尝试切换网络、关闭 Safari 内容拦截，查看是否出现代理或预检重定向。');
+    else if(direct&&!keyed)out.push('判断：无密钥请求可用，带 apikey 请求失败；重点排查 OPTIONS 预检、Safari 内容拦截、代理或网络重定向。');
+    else if(!direct&&keyed)out.push('判断：带 apikey 的跨域请求可用。无密钥健康检查可能被服务端拒绝，不代表登录必然失败；现在尝试登录。');
+    else out.push('判断：基础跨域请求可用；再尝试登录。如仍报 Load failed，请按时间查 Supabase 的 API Gateway / Auth 日志。');
+    out.push('本次诊断不读取或更改照片、笔画和 JSON。');
+  }catch(e){out.push('配置检查失败：'+e.message)}
+  const message=out.join('\n');display('诊断完成（点击云照片库查看结果）');
+  $('cloudDiagnosisResult').textContent=message;
+  alert(message);
+}
+
+async function getSession(){
+ if(!settings)throw Error('请先配置云照片库');if(!session)throw Error('请先登录云照片库');
+ if(Date.now()>session.expires_at-90_000){
+   try{await authToken('refresh_token',{refresh_token:session.refresh_token})}
+   catch(err){
+     // Crucial: a temporary Safari network outage must NOT delete a valid saved session.
+     if(isNetworkFailure(err))throw Error('云端会话刷新遇到网络问题，登录信息已保留；请联网后重试。'+err.message);
+     session=null;localStorage.removeItem(SESSION_KEY);renderLogin();
+     throw Error('登录已过期或被服务器拒绝，请重新登录：'+err.message);
+   }
+ }
+ return session;
+}
 async function request(path,options={}){
  const ss=await getSession();
  const h={'apikey':settings.key,'Authorization':`Bearer ${ss.access_token}`,...options.headers};
@@ -129,9 +195,18 @@ function init(){
  if(settings){$('cloudUrl').value=settings.url;$('cloudKey').value=settings.key}
  renderLogin();
  $('cloudOpen').onclick=()=>{$('cloudModal').style.display='flex';};
+ $('cloudModal').querySelector('h2').textContent='☁ 云照片库 · 连接修复 V1.3.1';
  $('cloudClose').onclick=()=>{$('cloudModal').style.display='none';};
  $('cloudSaveSettings').onclick=()=>{try{configureFromUI();note('云端配置已保存；请输入邮箱密码登录')}catch(e){alert(e.message)}};
  $('cloudLogin').onclick=login;
+ // A distinct control makes diagnosis available without making any login attempt.
+ const holder=$('cloudSaveSettings').parentElement;
+ const button=document.createElement('button');button.id='cloudDiagnose';button.type='button';button.textContent='诊断连接（无须密码）';
+ const report=document.createElement('pre');report.id='cloudDiagnosisResult';
+ report.style.cssText='white-space:pre-wrap;overflow-wrap:anywhere;color:#b9dcff;font-size:12px;margin:8px 0;max-height:200px;overflow:auto';
+ holder.appendChild(button);holder.parentElement.insertBefore(report,holder.nextSibling);
+ button.onclick=()=>diagnoseConnection();
+
  $('cloudUpload').onclick=uploadAll;
  $('cloudSync').onclick=()=>syncFromCloud(false);
  window.addEventListener('online',()=>syncFromCloud(true));
