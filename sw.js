@@ -1,6 +1,6 @@
 /* Stable V2.0: online network-first, offline cache fallback, never cache Supabase API */
-const CACHE='caihua-stable-v2-0-0';
-const FILES=['./','./index.html','./app.js?v=2.0.0','./cloud.js?v=2.0.0','./jszip.min.js?v=2.0.0','./manifest.webmanifest','./icon.svg'];
+const CACHE='caihua-stable-v2-0-1-cloudlist';
+const FILES=['./','./index.html','./app.js?v=2.0.1','./cloud.js?v=2.0.1','./jszip.min.js?v=2.0.0','./manifest.webmanifest','./icon.svg'];
 self.addEventListener('install',event=>event.waitUntil(caches.open(CACHE).then(cache=>cache.addAll(FILES)).then(()=>self.skipWaiting())));
 self.addEventListener('activate',event=>event.waitUntil((async()=>{
  const keys=await caches.keys();

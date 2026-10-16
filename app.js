@@ -4,7 +4,7 @@
 'use strict';
 const $ = id => document.getElementById(id);
 const WIDTH_BASE=.5, WIDTH_SCALE=22, DB_NAME='caihua-ipad-offline-v1';
-const state={db:null,queue:[],name:null,doc:null,image:null,url:null,zoom:1,offsetX:0,offsetY:0,tool:'brush',active:null,touches:new Map(),pinch:null,undo:[],redo:[],busy:false,saving:false,dirty:false,latestBackup:null};
+const state={db:null,queue:[],name:null,doc:null,image:null,url:null,zoom:1,offsetX:0,offsetY:0,tool:'brush',active:null,touches:new Map(),pinch:null,undo:[],redo:[],busy:false,saving:false,dirty:false,latestBackup:null,cloudVisibleNames:null,cloudRemoteCount:0};
 let noticeTimer;
 function note(str,ms=3000){const el=$('messages');el.textContent=str;el.style.display='block';clearTimeout(noticeTimer);noticeTimer=setTimeout(()=>el.style.display='none',ms)}
 function setStatus(str){$('status').textContent=str}
@@ -54,7 +54,27 @@ function dbPutPhotoRecord(photo,rec){return dbTransaction(['photos','records'],'
 function dbSaveDocRecord(doc,rec){return dbTransaction(['docs','records'],'readwrite',tx=>{tx.objectStore('docs').put(doc);tx.objectStore('records').put(rec)})}
 function blankDoc(name){return {name,status:'pending',strokes:[],updated:new Date().toISOString()}}
 async function loadQueue(){state.queue=(await dbAll('records')).sort((a,b)=>a.name.localeCompare(b.name,undefined,{numeric:true}));renderQueue()}
-function renderQueue(){const counts={pending:0,annotated:0,negative:0};for(const q of state.queue)counts[q.status||'pending']++;$('counts').textContent=`${state.queue.length} 张｜有裂隙 ${counts.annotated}｜无裂隙 ${counts.negative}｜待画 ${counts.pending}`;const host=$('queue');host.replaceChildren();for(const rec of state.queue){const b=document.createElement('button');b.className='tile'+(rec.name===state.name?' current':'');const n=document.createElement('span');n.textContent=rec.name;const v=document.createElement('span');v.className=rec.status==='pending'?'wait':'ok';v.textContent=rec.status==='annotated'?'✓':rec.status==='negative'?'○':'·';b.append(n,v);b.onclick=()=>go(rec.name);host.appendChild(b)}}
+// Cloud photo view is a display-only filter. All original blobs and brush JSON remain
+// untouched in IndexedDB, including photos deliberately removed from Supabase.
+function visibleRecords(){
+  return state.cloudVisibleNames ? state.queue.filter(q=>state.cloudVisibleNames.has(q.name.toLowerCase())) : state.queue;
+}
+function renderQueue(){
+  const visible=visibleRecords(),counts={pending:0,annotated:0,negative:0};
+  for(const q of visible)counts[q.status||'pending']++;
+  const hidden=state.queue.length-visible.length;
+  $('counts').textContent=state.cloudVisibleNames
+   ?`云盘 ${state.cloudRemoteCount}张｜已下载${visible.length}张｜本地隐藏${hidden}张（不删除）`
+   :`${state.queue.length} 张｜有裂隙 ${counts.annotated}｜无裂隙 ${counts.negative}｜待画 ${counts.pending}`;
+  const host=$('queue');host.replaceChildren();
+  for(const rec of visible){
+   const b=document.createElement('button');b.className='tile'+(rec.name===state.name?' current':'');
+   const n=document.createElement('span');n.textContent=rec.name;
+   const v=document.createElement('span');v.className=rec.status==='pending'?'wait':'ok';
+   v.textContent=rec.status==='annotated'?'✓':rec.status==='negative'?'○':'·';
+   b.append(n,v);b.onclick=()=>go(rec.name);host.appendChild(b);
+  }
+}
 // PNG IHDR contains the original dimensions. Parse 24 bytes instead of decoding
 // a 20-50MP bitmap for every newly synchronized image (a major Safari memory win).
 async function imgSize(blob){
@@ -206,7 +226,7 @@ async function pointerUp(e){
 async function setUndo(redo=false){if(state.saving||!state.doc)return;const source=redo?state.redo:state.undo,target=redo?state.undo:state.redo;if(!source.length)return;target.push(JSON.stringify({strokes:state.doc.strokes,status:state.doc.status}));Object.assign(state.doc,JSON.parse(source.pop()));await commitChange()}
 function setTool(t){state.tool=t;$('brush').classList.toggle('active',t==='brush');$('erase').classList.toggle('active',t==='erase')}
 async function negative(){if(!state.doc||state.saving)return;if(state.doc.strokes.length&&!confirm('当前照片存在裂隙笔画，确认无裂隙将清空它们。是否继续？'))return;queueUndo();state.doc.strokes=[];state.doc.status=state.doc.status==='negative'?'pending':'negative';await commitChange()}
-async function navigate(delta){const i=state.queue.findIndex(x=>x.name===state.name);if(i<0)return;const n=i+delta;if(n>=0&&n<state.queue.length)await go(state.queue[n].name)}
+async function navigate(delta){const visible=visibleRecords();const i=visible.findIndex(x=>x.name===state.name);if(i<0)return;const n=i+delta;if(n>=0&&n<visible.length)await go(visible[n].name)}
 function backupDoc(rec,doc){const stems=rec.name.replace(/\.[^.]+$/,'');return {image_id:stems,width:rec.width,height:rec.height,annotator:'ipad_offline',status:doc.status==='annotated'?'annotated':'pending',updated:doc.updated||new Date().toISOString(),boxes:[],masks:doc.strokes.map(s=>({id:s.id,class_id:1,type:'brush',points:s.pts,...(s.renderer===SMOOTH_RENDERER?{renderer:SMOOTH_RENDERER}:{})}))}}
 // Segmented, recoverable JSON-only backups. The original JPEG/PNG is never loaded
 // into memory during backup. Each batch has the full file manifest for safe merging.

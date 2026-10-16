@@ -120,6 +120,8 @@ async function uploadAll(){
   const oversized=state.queue.find(r=>r.bytes>50*1024*1024);if(oversized)throw Error(`${oversized.name} 超过 Supabase Free 单文件 50MB 上限；请升级云存储套餐或另选方案`);
   const total=state.queue.reduce((a,r)=>a+(r.bytes||0),0);if(total>900*1024*1024&&!confirm(`当前本机照片总量约 ${(total/1024/1024).toFixed(0)} MB，可能超过 Supabase Free 的1GB存储空间。仍要尝试上传吗？`))return;
   display('正在检查云端照片清单…');const cloud=new Set(await listCloud());let uploaded=0,skipped=0;
+   const localOnly=state.queue.filter(r=>!cloud.has(r.name));
+   if(localOnly.length&&!confirm(`当前本地有 ${localOnly.length} 张照片不在云盘。上传将把它们重新加入云端，包括可能已在 Supabase 删除的照片！\n\n确认要上传这 ${localOnly.length} 张吗？`)) {display('已取消上传；云端文件未改变');return;}
   const verified=readVerified();
   const jobs=[...state.queue.filter(r=>!cloud.has(r.name)),...state.queue.filter(r=>cloud.has(r.name))];
   for(let i=0;i<jobs.length;i++){
@@ -161,6 +163,7 @@ async function syncFromCloud(silent=false){
   await getSession();display('正在检查云端新照片…');
   await loadQueue();
   const remote=await listCloud();let done=0,skip=0;const verified=readVerified();
+   if(state.cloudVisibleNames){state.cloudVisibleNames=new Set(remote.map(n=>n.toLowerCase()));state.cloudRemoteCount=remote.length;}
   // Download missing photos FIRST; one-time SHA verification of local duplicates follows.
   const ordered=[...remote.filter(name=>!localRecord(name)),...remote.filter(name=>!!localRecord(name))];
   for(let i=0;i<ordered.length;i++){
@@ -191,6 +194,44 @@ async function syncFromCloud(silent=false){
  }catch(e){display('✕ '+e.message);if(!silent)alert('照片同步失败：'+e.message+'\n本地照片和标注没有被删除。')}
  finally{syncing=false;state.busy=false}
 }
+ // Read the cloud inventory WITHOUT redownloading huge photos or modifying local data.
+ // This does not delete IndexedDB items: removed cloud files are merely hidden.
+ async function refreshCloudInventory(){
+   if(busy||syncing||state.busy||state.saving||state.active||state.dirty){
+     alert('正在保存笔画或传输照片，请等待当前任务完成后再刷新云端清单');return;
+   }
+   if(!settings||!session){alert('请先登录云照片库');return;}
+   let target=null,clearCurrent=false;
+   busy=true;state.busy=true;
+   try{
+     await getSession();display('正在读取云端照片清单（不下载图片）…');
+     await loadQueue();
+     const names=await listCloud();
+     state.cloudVisibleNames=new Set(names.map(n=>n.toLowerCase()));
+     state.cloudRemoteCount=names.length;
+     renderQueue();
+     const visible=visibleRecords();
+     const missing=Math.max(0,names.length-visible.length);
+     const hidden=state.queue.length-visible.length;
+     if(!visible.some(r=>r.name===state.name)){
+       if(visible.length)target=visible[0].name;
+       else clearCurrent=true;
+     }
+     display(`✓ 云端清单 ${names.length} 张；本地已有 ${visible.length} 张；待下载 ${missing} 张；隐藏本地旧照片 ${hidden} 张（未删除）`);
+     note(missing ? `还有 ${missing} 张云端照片未下载；请点「同步云端照片」` : `云端清单已刷新：已显示 ${visible.length} 张；隐藏 ${hidden} 张本地旧照`,10000);
+   }catch(e){display('✕ 云端清单刷新失败：'+e.message);alert('云端清单刷新失败：'+e.message+'。本地文件与标注未删除。');}
+   finally{busy=false;state.busy=false;}
+   if(clearCurrent){
+     state.name=null;state.doc=null;state.image=null;
+     $('currentName').textContent='云端清单没有已下载的照片';draw();
+   }else if(target)await go(target);
+ }
+ async function showAllLocal(){
+   if(busy||syncing||state.busy||state.saving||state.active||state.dirty){alert('请等待画笔保存或传输完成');return;}
+   state.cloudVisibleNames=null;state.cloudRemoteCount=0;renderQueue();
+   if(!state.name && state.queue.length)await go(state.queue[0].name);
+   display(`✓ 已显示本地全部 ${state.queue.length} 张。没有删除或新增文件。`);
+ }
 function renderLogin(){
  $('cloudLogin').textContent=session?'退出账号':'登录云照片库';
  $('cloudAccount').textContent=session?`已登录：${session.user.email||session.user.id}`:'未登录';
@@ -220,6 +261,8 @@ function init(){
  holder.appendChild(button);holder.parentElement.insertBefore(report,holder.nextSibling);
  button.onclick=()=>diagnoseConnection();
 
+ $('cloudRefresh').onclick=refreshCloudInventory;
+ $('showAllLocal').onclick=showAllLocal;
  $('cloudUpload').onclick=uploadAll;
  $('cloudSync').onclick=()=>syncFromCloud(false);
  // Stable V2: NO background interval, online handler, visibility handler or auto-download.
