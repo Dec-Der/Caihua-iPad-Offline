@@ -1,4 +1,4 @@
-/* Caihua Cloud Photo Sync v1.3.1 (Safari login resilience + safe diagnostics) — ONLY images synchronize; annotations stay in device IndexedDB.
+/* Caihua Cloud Photo Sync v2.0 (manual, single-task transfers + safe diagnostics) — ONLY images synchronize; annotations stay in device IndexedDB.
    Supabase Auth password + private Storage bucket + per-user row-level access. No secret/service key. */
 'use strict';
 (()=>{
@@ -27,11 +27,12 @@ async function timedFetch(url,opts={},timeoutMs=16000){
   try{return await fetch(url,{...opts,signal:controller.signal})}finally{clearTimeout(timer)}
 }
 async function retryingFetch(url,opts,label){
+  const transferTimeout=opts?.body instanceof Blob?120000:90000;
   for(let attempt=1;attempt<=3;attempt++){
-    try{return await timedFetch(url,opts)}
+    try{return await timedFetch(url,opts,transferTimeout)}
     catch(e){
       if(!isNetworkFailure(e))throw e;
-      if(attempt===3)throw Error(`${label}网络请求未完成（${e.message||e.name}）。请点击「诊断连接」，并检查网络、DNS、Safari 内容拦截或跨域预检。`);
+      if(attempt===3 || (opts?.method==='POST' && !(url.includes('/auth/v1/')) && !(url.includes('/object/list/'))))throw Error(`${label}网络请求未完成（${e.message||e.name}）。请点击「诊断连接」，并检查网络、DNS、Safari 内容拦截或跨域预检。`);
       display(`${label}网络暂时失败，正在重试 ${attempt}/2…`);
       await delay(attempt===1?800:1800);
     }
@@ -49,7 +50,7 @@ async function authToken(grant,body){
 }
 // Safe diagnosis never transmits passwords or access tokens, and never logs keys.
 async function diagnoseConnection(){
-  const out=['云照片库连接诊断 V1.3.1'];
+  const out=['云照片库连接诊断 V2.0'];
   try{
     const s=validateSettings({url:$('cloudUrl').value,key:$('cloudKey').value});
     out.push('平台：'+location.origin,'云端主机：'+new URL(s.url).host,'设备在线状态：'+(navigator.onLine?'显示在线':'显示离线'));
@@ -89,7 +90,7 @@ async function getSession(){
 async function request(path,options={}){
  const ss=await getSession();
  const h={'apikey':settings.key,'Authorization':`Bearer ${ss.access_token}`,...options.headers};
- const r=await fetch(`${settings.url}/storage/v1/${path}`,{...options,headers:h,cache:'no-store'});
+ const r=await retryingFetch(`${settings.url}/storage/v1/${path}`,{...options,headers:h,cache:'no-store'},'云照片请求');
  if(!r.ok){const body=await r.json().catch(()=>({}));throw errorFromPayload(body,r.status)}
  return r;
 }
@@ -111,22 +112,30 @@ function checkedKey(name,sha){return settings.url+'|'+session.user.id+'|'+name+'
 async function hash(blob){const bytes=await crypto.subtle.digest('SHA-256',await blob.arrayBuffer());return [...new Uint8Array(bytes)].map(b=>b.toString(16).padStart(2,'0')).join('')}
 async function download(name){const r=await request('object/authenticated/'+BUCKET+'/'+encodedPath(name));return await r.blob()}
 async function uploadAll(){
- if(busy||state.busy||state.saving){display('正在执行其他任务，稍后再试');return}busy=true;
+ if(busy||syncing||state.busy||state.saving){display('正在执行其他任务，稍后再试');return}busy=true;state.busy=true;
  try{
   if(!navigator.onLine)throw Error('当前没有网络，无法上传');
   await getSession();await loadQueue();
   if(!state.queue.length)throw Error('Mac 页面尚未导入照片。请先点击「导入照片」');
   const oversized=state.queue.find(r=>r.bytes>50*1024*1024);if(oversized)throw Error(`${oversized.name} 超过 Supabase Free 单文件 50MB 上限；请升级云存储套餐或另选方案`);
   const total=state.queue.reduce((a,r)=>a+(r.bytes||0),0);if(total>900*1024*1024&&!confirm(`当前本机照片总量约 ${(total/1024/1024).toFixed(0)} MB，可能超过 Supabase Free 的1GB存储空间。仍要尝试上传吗？`))return;
-  display('正在检查云端照片…');const cloud=new Set(await listCloud());let uploaded=0,skipped=0;
-  for(let i=0;i<state.queue.length;i++){
-   const rec=state.queue[i];display(`正在上传 ${i+1}/${state.queue.length}：${rec.name}`);
-   const local=await dbGet('photos',rec.name);if(!local?.blob)throw Error('本地找不到 '+rec.name);
+  display('正在检查云端照片清单…');const cloud=new Set(await listCloud());let uploaded=0,skipped=0;
+  const verified=readVerified();
+  const jobs=[...state.queue.filter(r=>!cloud.has(r.name)),...state.queue.filter(r=>cloud.has(r.name))];
+  for(let i=0;i<jobs.length;i++){
+   const rec=jobs[i];
+   if(document.visibilityState==='hidden')throw Error('网页进入后台，传输已在当前文件后暂停；再次点击可续传');
+   display(`上传检查 ${i+1}/${jobs.length}：${rec.name}（新增${uploaded}张）`);
+   const key=checkedKey(rec.name,rec.sha256);
+   if(cloud.has(rec.name)&&verified[key]){skipped++;continue;}
    if(cloud.has(rec.name)){
+    // Check an unknown existing remote file ONCE; remember verified hash thereafter.
     const remote=await download(rec.name);
-    if(await hash(remote)!==rec.sha256)throw Error(`云端已存在同名但内容不同的照片 ${rec.name}，已停止；没有覆盖任何文件`);
+    if(await hash(remote)!==rec.sha256)throw Error(`云端同名文件内容不一致：${rec.name}。已停止且绝不覆盖`);
+    verified[key]=true;localStorage.setItem(VERIFIED_KEY,JSON.stringify(verified));
     skipped++;continue;
    }
+   const local=await dbGet('photos',rec.name);if(!local?.blob)throw Error('本地找不到 '+rec.name);
    const path='object/'+BUCKET+'/'+encodedPath(rec.name);
    try{await request(path,{method:'POST',headers:{'Content-Type':local.blob.type||'application/octet-stream','x-upsert':'false','cache-control':'max-age=0'},body:local.blob})}
    catch(e){
@@ -136,34 +145,38 @@ async function uploadAll(){
     }
     throw e;
    }
-   uploaded++;
+   uploaded++;verified[key]=true;localStorage.setItem(VERIFIED_KEY,JSON.stringify(verified));
   }
   display(`✓ 上传完成：新增 ${uploaded} 张，云端已存在 ${skipped} 张`);
-  alert(`Mac 已完成云照片上传：\n新增 ${uploaded} 张，云端已存在 ${skipped} 张。\n\n现在打开 iPad，联网后会自动同步到本地。`);
+  alert(`Mac 已完成云照片上传：\n新增 ${uploaded} 张，云端已存在 ${skipped} 张。\n\n现在打开 iPad，点击「同步云端照片」下载到本地。`);
  }catch(e){display('✕ '+e.message);alert('云端上传暂停：'+e.message+'\n\n已经上传成功的文件会保留。重新点击「Mac上传云端」可以安全续传。')}
- finally{busy=false}
+ finally{busy=false;state.busy=false}
 }
 async function syncFromCloud(silent=false){
- if(syncing||busy||state.busy||state.saving||state.active||state.dirty)return;
- if(!settings||!session||!navigator.onLine)return;
- syncing=true;
+ if(syncing||busy||state.busy||state.saving||state.active||state.dirty){if(!silent)alert('请先结束当前画笔并等待保存完成，再同步照片');return;}
+ if(!settings||!session){if(!silent)alert('请先打开「云照片库」并登录账号');return;}
+ if(!navigator.onLine){if(!silent)alert('当前设备离线；请连接互联网再同步照片');return;}
+ syncing=true;state.busy=true;
  try{
   await getSession();display('正在检查云端新照片…');
   await loadQueue();
   const remote=await listCloud();let done=0,skip=0;const verified=readVerified();
-  for(let i=0;i<remote.length;i++){
-   const name=remote[i];const local=localRecord(name);
+  // Download missing photos FIRST; one-time SHA verification of local duplicates follows.
+  const ordered=[...remote.filter(name=>!localRecord(name)),...remote.filter(name=>!!localRecord(name))];
+  for(let i=0;i<ordered.length;i++){
+   if(document.visibilityState==='hidden')throw Error('页面进入后台，暂停下载；已成功保存的照片保留，下次点击可以续传');
+   const name=ordered[i];const local=localRecord(name);
    if(local){
     const k=checkedKey(name,local.sha256);
     if(!verified[k]){
-      display(`正在校验同名照片 ${i+1}/${remote.length}：${name}`);
+      display(`正在校验同名照片 ${i+1}/${ordered.length}：${name}`);
       const remoteBlob=await download(name);
       if(await hash(remoteBlob)!==local.sha256)throw Error(`本机 ${name} 与云端同名照片内容不同；已停止，绝不覆盖旧原图或标注。请先核对名称。`);
       verified[k]=true;localStorage.setItem(VERIFIED_KEY,JSON.stringify(verified));
     }
     skip++;continue;
    }
-   display(`正在下载 ${i+1}/${remote.length}：${name}`);
+   display(`正在下载 ${i+1}/${ordered.length}：${name}`);
    const data=await download(name);
    // Original name is preserved; importOne hashes, validates image size and persists atomically.
    const typ=/\.png$/i.test(name)?'image/png':/\.webp$/i.test(name)?'image/webp':'image/jpeg';
@@ -176,7 +189,7 @@ async function syncFromCloud(silent=false){
   else if(!silent)note('云端暂无新照片，本地原有照片和标注未改变');
   await storageWarning();
  }catch(e){display('✕ '+e.message);if(!silent)alert('照片同步失败：'+e.message+'\n本地照片和标注没有被删除。')}
- finally{syncing=false}
+ finally{syncing=false;state.busy=false}
 }
 function renderLogin(){
  $('cloudLogin').textContent=session?'退出账号':'登录云照片库';
@@ -188,14 +201,14 @@ async function login(){try{
  if(session){if(!confirm('退出云照片库？已下载照片和标注不会被删除。'))return;session=null;localStorage.removeItem(SESSION_KEY);renderLogin();display('已退出云端账户，本地照片仍在');return}
  configureFromUI();const email=$('cloudEmail').value.trim(),password=$('cloudPassword').value;
  if(!email||!password)throw Error('请输入已在 Supabase 创建的邮箱与密码');
- await authToken('password',{email,password});display('✓ 登录成功，正在同步照片…');$('cloudModal').style.display='none';await syncFromCloud(true);
+ await authToken('password',{email,password});display('✓ 登录成功。请点击「同步云端照片」开始下载');$('cloudModal').style.display='none';
  }catch(e){display('✕ 登录失败：'+e.message);alert('云照片库登录失败：'+e.message)}}
 function init(){
  settings=readStored();try{session=JSON.parse(localStorage.getItem(SESSION_KEY)||'null')}catch{session=null}
  if(settings){$('cloudUrl').value=settings.url;$('cloudKey').value=settings.key}
  renderLogin();
  $('cloudOpen').onclick=()=>{$('cloudModal').style.display='flex';};
- $('cloudModal').querySelector('h2').textContent='☁ 云照片库 · 连接修复 V1.3.1';
+ $('cloudModal').querySelector('h2').textContent='☁ 云照片库 · 稳定版 V2.0';
  $('cloudClose').onclick=()=>{$('cloudModal').style.display='none';};
  $('cloudSaveSettings').onclick=()=>{try{configureFromUI();note('云端配置已保存；请输入邮箱密码登录')}catch(e){alert(e.message)}};
  $('cloudLogin').onclick=login;
@@ -209,12 +222,10 @@ function init(){
 
  $('cloudUpload').onclick=uploadAll;
  $('cloudSync').onclick=()=>syncFromCloud(false);
- window.addEventListener('online',()=>syncFromCloud(true));
- document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')syncFromCloud(true)});
- timer=setInterval(()=>{if(document.visibilityState==='visible')syncFromCloud(true)},60000);
- if(settings&&session&&navigator.onLine)setTimeout(()=>syncFromCloud(true),1400);
+ // Stable V2: NO background interval, online handler, visibility handler or auto-download.
+ // User-triggered sync keeps Safari memory free during Apple Pencil drawing.
  if(!settings)display('可配置云照片库：Mac 上传后 iPad 自动下载');
- else if(session)display('云端已登录，联网时自动下载新照片');
+ else if(session)display('已登录，需点击「同步云端照片」手动同步（绘制时不后台下载）');
  else display('已配置云端，请点击云照片库登录');
 }
 window.CaihuaCloud={init,uploadAll,syncFromCloud};
