@@ -1,10 +1,10 @@
-/* Caihua iPad Offline annotator v1.2 Smooth: private photos + stroke JSON live in iPad IndexedDB.
+/* Caihua iPad annotator V3.0, original V1.2 Smooth: private photos + stroke JSON live in iPad IndexedDB.
    Legacy strokes retain upstream ribbon geometry; new strokes use versioned round-dabs-v2.
    1–45 image px: radius = 0.5 + 22*filtered_pressure. */
 'use strict';
 const $ = id => document.getElementById(id);
 const WIDTH_BASE=.5, WIDTH_SCALE=22, DB_NAME='caihua-ipad-offline-v1';
-const state={db:null,queue:[],name:null,doc:null,image:null,url:null,zoom:1,offsetX:0,offsetY:0,tool:'brush',active:null,touches:new Map(),pinch:null,undo:[],redo:[],busy:false,saving:false,dirty:false,latestBackup:null,cloudVisibleNames:null,cloudRemoteCount:0};
+const state={db:null,queue:[],name:null,doc:null,image:null,url:null,zoom:1,offsetX:0,offsetY:0,tool:'brush',active:null,touches:new Map(),pinch:null,undo:[],redo:[],busy:false,saving:false,dirty:false,latestBackup:null};
 let noticeTimer;
 function note(str,ms=3000){const el=$('messages');el.textContent=str;el.style.display='block';clearTimeout(noticeTimer);noticeTimer=setTimeout(()=>el.style.display='none',ms)}
 function setStatus(str){$('status').textContent=str}
@@ -54,27 +54,7 @@ function dbPutPhotoRecord(photo,rec){return dbTransaction(['photos','records'],'
 function dbSaveDocRecord(doc,rec){return dbTransaction(['docs','records'],'readwrite',tx=>{tx.objectStore('docs').put(doc);tx.objectStore('records').put(rec)})}
 function blankDoc(name){return {name,status:'pending',strokes:[],updated:new Date().toISOString()}}
 async function loadQueue(){state.queue=(await dbAll('records')).sort((a,b)=>a.name.localeCompare(b.name,undefined,{numeric:true}));renderQueue()}
-// Cloud photo view is a display-only filter. All original blobs and brush JSON remain
-// untouched in IndexedDB, including photos deliberately removed from Supabase.
-function visibleRecords(){
-  return state.cloudVisibleNames ? state.queue.filter(q=>state.cloudVisibleNames.has(q.name.toLowerCase())) : state.queue;
-}
-function renderQueue(){
-  const visible=visibleRecords(),counts={pending:0,annotated:0,negative:0};
-  for(const q of visible)counts[q.status||'pending']++;
-  const hidden=state.queue.length-visible.length;
-  $('counts').textContent=state.cloudVisibleNames
-   ?`云盘 ${state.cloudRemoteCount}张｜已下载${visible.length}张｜本地隐藏${hidden}张（不删除）`
-   :`${state.queue.length} 张｜有裂隙 ${counts.annotated}｜无裂隙 ${counts.negative}｜待画 ${counts.pending}`;
-  const host=$('queue');host.replaceChildren();
-  for(const rec of visible){
-   const b=document.createElement('button');b.className='tile'+(rec.name===state.name?' current':'');
-   const n=document.createElement('span');n.textContent=rec.name;
-   const v=document.createElement('span');v.className=rec.status==='pending'?'wait':'ok';
-   v.textContent=rec.status==='annotated'?'✓':rec.status==='negative'?'○':'·';
-   b.append(n,v);b.onclick=()=>go(rec.name);host.appendChild(b);
-  }
-}
+function renderQueue(){const counts={pending:0,annotated:0,negative:0};for(const q of state.queue)counts[q.status||'pending']++;$('counts').textContent=`${state.queue.length} 张｜有裂隙 ${counts.annotated}｜无裂隙 ${counts.negative}｜待画 ${counts.pending}`;const host=$('queue');host.replaceChildren();for(const rec of state.queue){const b=document.createElement('button');b.className='tile'+(rec.name===state.name?' current':'');const n=document.createElement('span');n.textContent=rec.name;const v=document.createElement('span');v.className=rec.status==='pending'?'wait':'ok';v.textContent=rec.status==='annotated'?'✓':rec.status==='negative'?'○':'·';b.append(n,v);b.onclick=()=>go(rec.name);host.appendChild(b)}}
 // PNG IHDR contains the original dimensions. Parse 24 bytes instead of decoding
 // a 20-50MP bitmap for every newly synchronized image (a major Safari memory win).
 async function imgSize(blob){
@@ -92,10 +72,29 @@ async function imgSize(blob){
 }
 async function importOne(file){if(!/\.(png|jpe?g|webp)$/i.test(file.name))return 'skip';if(!crypto.subtle)throw Error('浏览器未提供安全的SHA-256校验；请使用HTTPS打开');const digest=await crypto.subtle.digest('SHA-256',await file.arrayBuffer());const sha256=Array.from(new Uint8Array(digest),b=>b.toString(16).padStart(2,'0')).join('');const existing=state.queue.find(x=>x.name.toLowerCase()===file.name.toLowerCase());if(existing){if(existing.sha256&&existing.sha256!==sha256)throw Error(`${file.name} 与本机已有同名照片内容不同，禁止覆盖！`);return 'dup'}const [width,height]=await imgSize(file);if(!width||!height)throw Error(`${file.name} 图片无效`); // write photos before metadata; no record if interrupted
 const rec={name:file.name,width,height,bytes:file.size,sha256,status:'pending',added:new Date().toISOString()};await dbPutPhotoRecord({name:file.name,blob:file},rec);state.queue.push(rec);return 'ok'}
+
+// V3: cloud bytes are stored as supplied. Only one file at a time is held in memory.
+// Name + byte-length checks prevent accidental mapping to another labeled image.
+async function importCloudBlob(blob,name,expectedSize){
+  if(!/\.(png|jpe?g|webp)$/i.test(name))throw Error('照片格式不支持：'+name);
+  if(expectedSize && blob.size!==expectedSize)throw Error(name+' 传输长度不一致，已拒绝保存');
+  const existing=state.queue.find(q=>q.name.toLowerCase()===name.toLowerCase());
+  if(existing){
+    if(existing.bytes&&existing.bytes!==blob.size)throw Error(name+' 本地与云端同名图片大小不同，禁止覆盖');
+    return 'dup';
+  }
+  const [width,height]=await imgSize(blob);
+  if(!(width>0&&height>0))throw Error(name+' 图片尺寸无法确认');
+  const rec={name,width,height,bytes:blob.size,status:'pending',added:new Date().toISOString(),source:'supabase'};
+  await dbPutPhotoRecord({name,blob},rec);
+  state.queue.push(rec);
+  return 'ok';
+}
+
 async function importFiles(files){if(state.busy)return;state.busy=true;try{await loadQueue();let ok=0,dup=0,skip=0;for(let i=0;i<files.length;i++){setStatus(`正在导入 ${i+1}/${files.length}`);try{const r=await importOne(files[i]);if(r==='ok')ok++;else if(r==='dup')dup++;else skip++}catch(e){note(`导入 ${files[i].name} 失败：${e.message}`,9000);break}}await loadQueue();setStatus(`本机已接收 ${state.queue.length} 张`);note(`导入 ${ok} 张；重复 ${dup}；忽略 ${skip}。请检查 iPad 剩余空间。`,6500);if(!state.name&&state.queue.length)await go(state.queue[0].name)}finally{state.busy=false;await storageWarning()}}
 async function importZip(file){if(file.size>260*1024*1024){alert('照片压缩包超过 260MB，请在 Mac 使用随包脚本拆成较小的分批 ZIP 后再导入。');return}if(state.busy)return;state.busy=true;try{setStatus('正在读取 ZIP…');const zip=await JSZip.loadAsync(file,{checkCRC32:true});const paths=Object.values(zip.files).filter(x=>!x.dir&&!x.name.startsWith('__MACOSX/')&&/\.(png|jpe?g|webp)$/i.test(x.name));if(paths.length>200)throw Error('每个 ZIP 建议不超过 200 张，请分批处理');await loadQueue();let ok=0,dup=0;for(let i=0;i<paths.length;i++){const entry=paths[i];const name=entry.name.split('/').pop();setStatus(`照片 ZIP ${i+1}/${paths.length}：${name}`);const data=await entry.async('blob');const ext=name.split('.').pop().toLowerCase();const type=ext==='png'?'image/png':ext==='webp'?'image/webp':'image/jpeg';const result=await importOne(new File([data],name,{type}));if(result==='ok')ok++;else if(result==='dup')dup++}await loadQueue();note(`ZIP 导入 ${ok} 张，重复 ${dup} 张`,6500);if(!state.name&&state.queue.length)await go(state.queue[0].name)}catch(e){alert('ZIP 导入中断：'+e.message+'。已成功导入的照片仍保存在 iPad。')}finally{state.busy=false;setStatus('本机存储就绪');await storageWarning()}}
 async function storageWarning(){if(!navigator.storage?.estimate)return;try{const {usage,quota}=await navigator.storage.estimate();if(quota&&usage/quota>.72)note('警告：本地存储使用率较高，请马上导出备份，并分批处理照片',11000)}catch(e){}}
-async function go(name){if(state.busy||state.saving)return;if(state.active){note('请先抬笔结束当前笔画');return}if(state.dirty&&!(await save()))return;const rec=state.queue.find(x=>x.name===name);if(!rec)return;state.name=name;state.doc=await dbGet('docs',name)||blankDoc(name);state.undo=[];state.redo=[];const saved=await dbGet('photos',name);if(!saved?.blob){alert('该照片未完整保存，请重新导入');return}if(state.url)URL.revokeObjectURL(state.url);state.url=URL.createObjectURL(saved.blob);const im=new Image();im.onload=()=>{if(state.name!==name)return;state.image=im;fit();renderQueue()};im.onerror=()=>alert('iPad 无法解码 '+name);im.src=state.url;$('currentName').textContent=name;setStatus('iPad 本地已载入')}
+async function go(name){if(state.busy||state.saving)return;if(state.active){note('请先抬笔结束当前笔画');return}if(state.dirty&&!(await save()))return;const rec=state.queue.find(x=>x.name===name);if(!rec)return;state.name=name;state.doc=await dbGet('docs',name)||blankDoc(name);state.undo=[];state.redo=[];const saved=await dbGet('photos',name);if(!saved?.blob){alert('该照片未完整保存，请重新导入');return}if(state.url)URL.revokeObjectURL(state.url);state.url=URL.createObjectURL(saved.blob);state.image=null;const im=new Image();im.onload=()=>{if(state.name!==name)return;state.image=im;fit();renderQueue()};im.onerror=()=>alert('iPad 无法解码 '+name);im.src=state.url;$('currentName').textContent=name;setStatus('iPad 本地已载入')}
 function fit(){if(!state.image)return;const r=$('view').getBoundingClientRect();state.zoom=Math.min(r.width/state.image.naturalWidth,r.height/state.image.naturalHeight)*.97;state.offsetX=(r.width-state.image.naturalWidth*state.zoom)/2;state.offsetY=(r.height-state.image.naturalHeight*state.zoom)/2;draw()}
 function resized(){const toolbar=document.querySelector('.toolbar');$('view').style.top=Math.ceil(toolbar.getBoundingClientRect().height)+'px';const canvas=$('paint'),rect=$('view').getBoundingClientRect(),dpr=Math.min(window.devicePixelRatio||1,2.5);canvas.width=Math.max(1,Math.round(rect.width*dpr));canvas.height=Math.max(1,Math.round(rect.height*dpr));canvas.style.width=rect.width+'px';canvas.style.height=rect.height+'px';if(state.image)draw()}
 function pt(e){const r=$('paint').getBoundingClientRect();return {x:(e.clientX-r.left-state.offsetX)/state.zoom,y:(e.clientY-r.top-state.offsetY)/state.zoom}}
@@ -226,7 +225,7 @@ async function pointerUp(e){
 async function setUndo(redo=false){if(state.saving||!state.doc)return;const source=redo?state.redo:state.undo,target=redo?state.undo:state.redo;if(!source.length)return;target.push(JSON.stringify({strokes:state.doc.strokes,status:state.doc.status}));Object.assign(state.doc,JSON.parse(source.pop()));await commitChange()}
 function setTool(t){state.tool=t;$('brush').classList.toggle('active',t==='brush');$('erase').classList.toggle('active',t==='erase')}
 async function negative(){if(!state.doc||state.saving)return;if(state.doc.strokes.length&&!confirm('当前照片存在裂隙笔画，确认无裂隙将清空它们。是否继续？'))return;queueUndo();state.doc.strokes=[];state.doc.status=state.doc.status==='negative'?'pending':'negative';await commitChange()}
-async function navigate(delta){const visible=visibleRecords();const i=visible.findIndex(x=>x.name===state.name);if(i<0)return;const n=i+delta;if(n>=0&&n<visible.length)await go(visible[n].name)}
+async function navigate(delta){const i=state.queue.findIndex(x=>x.name===state.name);if(i<0)return;const n=i+delta;if(n>=0&&n<state.queue.length)await go(state.queue[n].name)}
 function backupDoc(rec,doc){const stems=rec.name.replace(/\.[^.]+$/,'');return {image_id:stems,width:rec.width,height:rec.height,annotator:'ipad_offline',status:doc.status==='annotated'?'annotated':'pending',updated:doc.updated||new Date().toISOString(),boxes:[],masks:doc.strokes.map(s=>({id:s.id,class_id:1,type:'brush',points:s.pts,...(s.renderer===SMOOTH_RENDERER?{renderer:SMOOTH_RENDERER}:{})}))}}
 // Segmented, recoverable JSON-only backups. The original JPEG/PNG is never loaded
 // into memory during backup. Each batch has the full file manifest for safe merging.

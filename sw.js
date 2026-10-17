@@ -1,25 +1,12 @@
-/* Stable V2.0: online network-first, offline cache fallback, never cache Supabase API */
-const CACHE='caihua-stable-v2-0-1-cloudlist';
-const FILES=['./','./index.html','./app.js?v=2.0.1','./cloud.js?v=2.0.1','./jszip.min.js?v=2.0.0','./manifest.webmanifest','./icon.svg'];
-self.addEventListener('install',event=>event.waitUntil(caches.open(CACHE).then(cache=>cache.addAll(FILES)).then(()=>self.skipWaiting())));
-self.addEventListener('activate',event=>event.waitUntil((async()=>{
- const keys=await caches.keys();
- for(const key of keys)if((key.startsWith('caihua-')||key.startsWith('caihua-offline-'))&&key!==CACHE)await caches.delete(key);
- await self.clients.claim();
-})()));
-self.addEventListener('fetch',event=>{
- const req=event.request,url=new URL(req.url);
- if(req.method!=='GET'||url.origin!==self.location.origin)return;
- event.respondWith((async()=>{
-   try{
-     const r=await fetch(req,{cache:'no-store'});
-     if(r.ok){const store=await caches.open(CACHE);await store.put(req,r.clone());}
-     return r;
-   }catch(e){
-     const cache=await caches.open(CACHE);
-     const hit=await cache.match(req)|| (req.mode==='navigate'?await cache.match('./index.html'):null);
-     if(hit)return hit;
-     throw e;
-   }
+/* Caihua V3.0 - static shell only; photos / JSON remain in IndexedDB */
+const CACHE='caihua-lean-v3-0-0';
+const ASSETS=['./','./index.html','./mac.html','./app.js?v=3.0.0','./cloud-core.js?v=3.0.0','./cloud.js?v=3.0.0','./mac-upload.js?v=3.0.0','./jszip.min.js?v=3.0.0','./icon.svg','./manifest.webmanifest'];
+self.addEventListener('install',e=>e.waitUntil(caches.open(CACHE).then(c=>c.addAll(ASSETS)).then(()=>self.skipWaiting())));
+self.addEventListener('activate',e=>e.waitUntil((async()=>{for(const key of await caches.keys())if(key.startsWith('caihua-')&&key!==CACHE)await caches.delete(key);await self.clients.claim();})()));
+self.addEventListener('fetch',e=>{
+ const req=e.request,u=new URL(req.url);if(req.method!=='GET'||u.origin!==self.location.origin)return;
+ e.respondWith((async()=>{
+  try{const r=await fetch(req,{cache:'no-store'});if(r.ok){const c=await caches.open(CACHE);await c.put(req,r.clone())}return r}
+  catch(err){const c=await caches.open(CACHE);const hit=await c.match(req)||(req.mode==='navigate'?await c.match('./index.html'):null);if(hit)return hit;throw err}
  })());
 });
