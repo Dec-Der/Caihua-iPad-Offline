@@ -85,7 +85,7 @@ async function importCloudBlob(blob,name,expectedSize){
   }
   const [width,height]=await imgSize(blob);
   if(!(width>0&&height>0))throw Error(name+' 图片尺寸无法确认');
-  const rec={name,width,height,bytes:blob.size,status:'pending',added:new Date().toISOString(),source:'supabase'};
+  const rec={name,width,height,bytes:blob.size,status:'pending',added:new Date().toISOString(),source:'supabase',cloud:{url:window.CaihuaApi.settings().url,owner:window.CaihuaApi.owner()}};
   await dbPutPhotoRecord({name,blob},rec);
   state.queue.push(rec);
   return 'ok';
@@ -222,9 +222,9 @@ async function pointerUp(e){
   delete stroke.pointerId;delete stroke.firstWasMissingPressure;
   queueUndo();state.doc.strokes.push(stroke);state.doc.status='annotated';await commitChange();
 }
-async function setUndo(redo=false){if(state.saving||!state.doc)return;const source=redo?state.redo:state.undo,target=redo?state.undo:state.redo;if(!source.length)return;target.push(JSON.stringify({strokes:state.doc.strokes,status:state.doc.status}));Object.assign(state.doc,JSON.parse(source.pop()));await commitChange()}
+async function setUndo(redo=false){if(state.busy||state.saving||!state.doc)return;const source=redo?state.redo:state.undo,target=redo?state.undo:state.redo;if(!source.length)return;target.push(JSON.stringify({strokes:state.doc.strokes,status:state.doc.status}));Object.assign(state.doc,JSON.parse(source.pop()));await commitChange()}
 function setTool(t){state.tool=t;$('brush').classList.toggle('active',t==='brush');$('erase').classList.toggle('active',t==='erase')}
-async function negative(){if(!state.doc||state.saving)return;if(state.doc.strokes.length&&!confirm('当前照片存在裂隙笔画，确认无裂隙将清空它们。是否继续？'))return;queueUndo();state.doc.strokes=[];state.doc.status=state.doc.status==='negative'?'pending':'negative';await commitChange()}
+async function negative(){if(!state.doc||state.busy||state.saving)return;if(state.doc.strokes.length&&!confirm('当前照片存在裂隙笔画，确认无裂隙将清空它们。是否继续？'))return;queueUndo();state.doc.strokes=[];state.doc.status=state.doc.status==='negative'?'pending':'negative';await commitChange()}
 async function navigate(delta){const i=state.queue.findIndex(x=>x.name===state.name);if(i<0)return;const n=i+delta;if(n>=0&&n<state.queue.length)await go(state.queue[n].name)}
 function backupDoc(rec,doc){const stems=rec.name.replace(/\.[^.]+$/,'');return {image_id:stems,width:rec.width,height:rec.height,annotator:'ipad_offline',status:doc.status==='annotated'?'annotated':'pending',updated:doc.updated||new Date().toISOString(),boxes:[],masks:doc.strokes.map(s=>({id:s.id,class_id:1,type:'brush',points:s.pts,...(s.renderer===SMOOTH_RENDERER?{renderer:SMOOTH_RENDERER}:{})}))}}
 // Segmented, recoverable JSON-only backups. The original JPEG/PNG is never loaded
@@ -310,6 +310,7 @@ async function shareBackup(){
   $('nextBackup').disabled=false;note('已触发下载，请在文件App核验 ZIP 保存成功',10000);
 }
 function nextBackup(){
+  if(state.busy)return;
   if(!state.latestBackup)return;
   if(!confirm('请先在 iPad“文件”App确认当前 JSON ZIP 已保存成功，再进入下一包。确认吗？'))return;
   state.latestBackup=null;$('shareBackup').disabled=true;$('nextBackup').disabled=true;backupPart++;

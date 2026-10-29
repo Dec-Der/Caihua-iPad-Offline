@@ -4,8 +4,8 @@
 const $=id=>document.getElementById(id),api=window.CaihuaApi;let busy=false;
 const display=s=>$('cloudStatus').textContent=s;
 function logged(){const user=api.session()?.user;$('cloudLogin').textContent=user?'退出账号':'登录云照片库';$('cloudAccount').textContent=user?'已登录：'+(user.email||user.id):'未登录';$('cloudPassword').value=''}
-function save(){api.configure($('cloudUrl').value,$('cloudKey').value);display('云端配置已保存')}
-async function login(){try{if(api.session()){if(confirm('退出账号？iPad本地照片及标注不会被删除。')){api.logout();logged()}return;}const email=$('cloudEmail').value,password=$('cloudPassword').value;save();await api.login(email,password);logged();$('cloudModal').style.display='none';display('✓ 云照片库已登录')}catch(e){display('登录失败：'+e.message);alert('云照片库登录失败：'+e.message)}}
+function save(){if(state.busy)throw Error('任务进行中，请完成后修改云端配置');api.configure($('cloudUrl').value,$('cloudKey').value);display('云端配置已保存')}
+async function login(){try{if(state.busy)throw Error("任务进行中，请完成后切换账号");if(api.session()){if(confirm('退出账号？iPad本地照片及标注不会被删除。')){api.logout();logged()}return;}const email=$('cloudEmail').value,password=$('cloudPassword').value;save();await api.login(email,password);logged();$('cloudModal').style.display='none';display('✓ 云照片库已登录')}catch(e){display('登录失败：'+e.message);alert('云照片库登录失败：'+e.message)}}
 async function sync(){
  if(busy||state.busy||state.saving||state.active||state.dirty){alert('正在画笔保存或执行其他任务，请结束并等待完成');return}
  if(!navigator.onLine){alert('iPad 目前离线，请联网后再同步新照片');return}

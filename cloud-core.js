@@ -54,7 +54,20 @@ async function upload(file){
  const r=await storage('object/'+BUCKET+'/'+path(file.name),{method:'POST',headers:{'Content-Type':file.type||'application/octet-stream','x-upsert':'false'},body:file},180000,0);
  return parseResponse(r);
 }
+// Deletion is explicit, scoped to the account/project reviewed by the user,
+// and never retried automatically after an uncertain network result.
+async function removePhoto(name,expected){
+ const s=await auth();
+ if(!expected||settings.url!==expected.url||s.user.id!==expected.owner)
+   throw Error('云端账号或项目已改变，请重新打开清理窗口');
+ path(name); // Validate the basename before constructing the raw Storage path.
+ const r=await http(`${settings.url}/storage/v1/object/${BUCKET}`,{
+   method:'DELETE',headers:{apikey:settings.key,Authorization:'Bearer '+s.access_token,'Content-Type':'application/json'},
+   body:JSON.stringify({prefixes:[s.user.id+'/'+name]})
+ },60000,0);
+ return parseResponse(r);
+}
 async function diagnosis(){if(!settings)throw Error('先保存 Project URL 和公钥');const r=await http(settings.url+'/auth/v1/health',{headers:{apikey:settings.key}},15000,0);return {status:r.status,connected:true};}
-window.CaihuaApi={restore,configure,logout,login,auth,owner,list,download,upload,diagnosis,session:()=>session,settings:()=>settings,BUCKET};
+window.CaihuaApi={restore,configure,logout,login,auth,owner,list,download,upload,removePhoto,diagnosis,session:()=>session,settings:()=>settings,BUCKET};
 restore();
 })();
