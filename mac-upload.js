@@ -55,7 +55,6 @@ async function uploadAll(){if(uploading||!selected.length)return;uploading=true;
   log('已存在 '+skipped+' 张；只传新增的 '+jobs.length+' 张（同名同大小按清单跳过；不能证明内容完全一致）');
   for(let i=0;i<jobs.length;i++){
     if(stop){log('用户暂停。已完成文件不会重传');break}
-    if(document.visibilityState==='hidden'){log('页面转到后台，已暂停；保持Mac页面在前台可获得稳定速度');break}
     const f=jobs[i];if(f.size>50*1024*1024)throw Error(f.name+' 超过当前预设50MB限制，请在Supabase查看项目与bucket的真实限额');
     status(`上传 ${i+1}/${jobs.length}：${f.name}`);
     try{
@@ -68,14 +67,17 @@ async function uploadAll(){if(uploading||!selected.length)return;uploading=true;
       else{failed++;log('✕ '+f.name+' '+e.message);break}
     }
   }
-  status(`新上传 ${ok} 张｜已存在/核实 ${skipped} 张｜失败 ${failed} 张。重新选同一批可续传或跳过`);
-  log('本批处理结束，新上传'+ok+'张，跳过'+skipped+'张，失败'+failed+'张');
+  const pending=selected.length-ok-skipped-failed;
+  const result=pending||failed?'本批尚未完成':'本批全部完成';
+  status(`${result}：新上传 ${ok} 张｜已存在/核实 ${skipped} 张｜失败 ${failed} 张｜待处理 ${pending} 张。${pending||failed?'点击“开始上传”继续，已完成文件会自动跳过':'可选择下一批照片'}`);
+  log(`${result}，新上传${ok}张，跳过${skipped}张，失败${failed}张，待处理${pending}张`);
  }catch(e){status('传输暂停：'+e.message);log('传输暂停：'+e.message)}
  finally{uploading=false;$('stop').disabled=true;render()}
 }
 async function remoteList(){try{await api.auth();status('读取云端照片…');const photos=await api.list();$('remoteList').textContent=photos.map(x=>x.name+'  '+(x.bytes?(x.bytes/1024/1024).toFixed(1)+'MB':'')).join('\n');$('remoteCount').textContent=`当前账号云端 ${photos.length} 张`;status('读取成功')}
  catch(e){status('读取失败：'+e.message)}}
 function init(){const s=api.settings();if(s){$('url').value=s.url;$('key').value=s.key}logged();
+ document.addEventListener('visibilitychange',()=>{if(uploading)log(document.visibilityState==='hidden'?'页面已转到后台，继续上传；请勿关闭页面或让 Mac 休眠':'页面已回到前台，继续当前上传任务')});
  $('save').onclick=()=>{try{save()}catch(e){status(e.message)}};$('login').onclick=login;
  $('photos').onchange=e=>{choose(e.target.files);e.target.value=''};
  $('upload').onclick=uploadAll;$('stop').onclick=()=>{stop=true;status('已请求暂停，等待当前文件结束')};$('list').onclick=remoteList;
