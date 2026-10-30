@@ -1,4 +1,4 @@
-/* Caihua iPad annotator V3.0, original V1.2 Smooth: private photos + stroke JSON live in iPad IndexedDB.
+/* Caihua iPad annotator V3.1.2 pen-tip fix, original V1.2 Smooth: private photos + stroke JSON live in iPad IndexedDB.
    Legacy strokes retain upstream ribbon geometry; new strokes use versioned round-dabs-v2.
    1–45 image px: radius = 0.5 + 22*filtered_pressure. */
 'use strict';
@@ -105,6 +105,14 @@ function drawRibbon(ctx,pts){if(!pts||!pts.length)return;ctx.beginPath();const r
 // spacing and pressure interpolation MUST match the Mac round-dabs-v2 exporter.
 const SMOOTH_RENDERER='round-dabs-v2';
 const PRESSURE_SMOOTH_DISTANCE=5; // original image px; damping isolated spikes
+// On iPad Safari, the first pen pointerdown may have pressure 0 (unreported).
+// Do not invent 0.5 (=23px wide!) for a very light touch. This is only used
+// when the initial Apple Pencil pressure is missing; the usual 1..45px mapping
+// and the round-dabs-v2 renderer remain unchanged.
+const PEN_MISSING_START_PRESSURE=.02;
+const PEN_TIP_CORRECTION_DISTANCE=7; // source-image pixels, not display pixels
+const PEN_TIP_SPIKE_RATIO=1.8;
+const PEN_TIP_SPIKE_DROP=.05;
 function samplePressure(e,fallback=.5){return Number.isFinite(e.pressure)&&e.pressure>0&&e.pressure<=1?e.pressure:fallback}
 function roundDabs(pts,cb){
   if(!pts?.length)return;
@@ -140,8 +148,30 @@ function addPenSample(s,ev){
   const p=pt(ev),pts=s.pts,prev=pts[pts.length-1];
   if(!Number.isFinite(p.x)||!Number.isFinite(p.y))return;
   const d=Math.hypot(p.x-prev[0],p.y-prev[1]);
-  if(pts.length===1&&s.firstWasMissingPressure&&ev.pressure>0&&ev.pressure<=1){
-    pts[0][2]=ev.pressure;s.firstWasMissingPressure=false;
+  // Correct a transient thick first dab while we still have the first 7
+  // image pixels of a pen stroke in memory. The correction updates the
+  // recorded pressure values, so the Mac JSON -> PNG renderer remains exact.
+  // Never rewrite previous/saved strokes, and never alter pressure during
+  // ordinary segments after this tiny pen-tip window.
+  const validPressure=Number.isFinite(ev.pressure)&&ev.pressure>0&&ev.pressure<=1;
+  if(s.penStart&&validPressure){
+    const origin=pts[0];
+    const fromStart=Math.hypot(p.x-origin[0],p.y-origin[1]);
+    if(fromStart<=PEN_TIP_CORRECTION_DISTANCE){
+      if(pts.length===1&&s.firstWasMissingPressure){
+        pts[0][2]=ev.pressure;s.firstWasMissingPressure=false;
+      }
+      if(origin[2]>ev.pressure*PEN_TIP_SPIKE_RATIO
+          && origin[2]-ev.pressure>=PEN_TIP_SPIKE_DROP){
+        for(const q of pts){
+          if(Math.hypot(q[0]-origin[0],q[1]-origin[1])<=PEN_TIP_CORRECTION_DISTANCE){
+            q[2]=Math.min(q[2],ev.pressure);
+          }
+        }
+      }
+    }else{
+      s.penStart=false;
+    }
   }
   // Ignore sub-pixel sampling jitter, but retain genuine travel.
   if(d<Math.max(.25,.25/Math.max(.2,state.zoom)))return;
@@ -190,11 +220,12 @@ function pointerDown(e){
   if(state.tool==='erase'){
     const n=nearestStroke(pt(e));if(n>=0){queueUndo();state.doc.strokes.splice(n,1);state.doc.status=state.doc.strokes.length?'annotated':'pending';commitChange()}return;
   }
-  const p=pt(e);
+  const p=pt(e),isPen=e.pointerType==='pen';
   state.active={id:'mask_'+Date.now().toString(36)+'_'+Math.floor(Math.random()*1e5),
     renderer:SMOOTH_RENDERER,pointerId:e.pointerId,
+    penStart:isPen,
     firstWasMissingPressure:!(e.pressure>0&&e.pressure<=1),
-    pts:[[p.x,p.y,samplePressure(e)]]};
+    pts:[[p.x,p.y,samplePressure(e,isPen?PEN_MISSING_START_PRESSURE:.5)]]};
   draw();e.preventDefault();
 }
 let paintingFrame=0;
@@ -219,7 +250,7 @@ async function pointerUp(e){
   const stroke=state.active;state.active=null;
   // Do NOT use pointerup pressure (often zero). A tap becomes a 1px-distance dot.
   if(stroke.pts.length===1){const p=stroke.pts[0];stroke.pts.push([p[0]+.001,p[1]+.001,p[2]])}
-  delete stroke.pointerId;delete stroke.firstWasMissingPressure;
+  delete stroke.pointerId;delete stroke.firstWasMissingPressure;delete stroke.penStart;
   queueUndo();state.doc.strokes.push(stroke);state.doc.status='annotated';await commitChange();
 }
 async function setUndo(redo=false){if(state.busy||state.saving||!state.doc)return;const source=redo?state.redo:state.undo,target=redo?state.undo:state.redo;if(!source.length)return;target.push(JSON.stringify({strokes:state.doc.strokes,status:state.doc.status}));Object.assign(state.doc,JSON.parse(source.pop()));await commitChange()}
