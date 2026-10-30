@@ -1,4 +1,4 @@
-/* Caihua iPad annotator V3.1.2 pen-tip fix, original V1.2 Smooth: private photos + stroke JSON live in iPad IndexedDB.
+/* Caihua iPad annotator V3.1.3 gentle pressure tuning, original V1.2 Smooth: private photos + stroke JSON live in iPad IndexedDB.
    Legacy strokes retain upstream ribbon geometry; new strokes use versioned round-dabs-v2.
    1–45 image px: radius = 0.5 + 22*filtered_pressure. */
 'use strict';
@@ -113,7 +113,14 @@ const PEN_MISSING_START_PRESSURE=.02;
 const PEN_TIP_CORRECTION_DISTANCE=7; // source-image pixels, not display pixels
 const PEN_TIP_SPIKE_RATIO=1.8;
 const PEN_TIP_SPIKE_DROP=.05;
-function samplePressure(e,fallback=.5){return Number.isFinite(e.pressure)&&e.pressure>0&&e.pressure<=1?e.pressure:fallback}
+// Very small Apple Pencil-only sensitivity adjustment: 0 and 1 stay fixed.
+// 1.06 means an approx. 0.9px narrower width at mid-pressure, with the
+// original 1..45px full range and the round-dabs-v2 JSON format unchanged.
+const PEN_PRESSURE_CURVE=1.06;
+function samplePressure(e,fallback=.5){
+  if(!(Number.isFinite(e.pressure)&&e.pressure>0&&e.pressure<=1))return fallback;
+  return e.pointerType==='pen'?Math.pow(e.pressure,PEN_PRESSURE_CURVE):e.pressure;
+}
 function roundDabs(pts,cb){
   if(!pts?.length)return;
   const rad=p=>WIDTH_BASE+WIDTH_SCALE*Math.max(0,Math.min(1,p[2]??.5));
@@ -154,18 +161,19 @@ function addPenSample(s,ev){
   // Never rewrite previous/saved strokes, and never alter pressure during
   // ordinary segments after this tiny pen-tip window.
   const validPressure=Number.isFinite(ev.pressure)&&ev.pressure>0&&ev.pressure<=1;
+  const measuredPressure=samplePressure(ev,prev[2]);
   if(s.penStart&&validPressure){
     const origin=pts[0];
     const fromStart=Math.hypot(p.x-origin[0],p.y-origin[1]);
     if(fromStart<=PEN_TIP_CORRECTION_DISTANCE){
       if(pts.length===1&&s.firstWasMissingPressure){
-        pts[0][2]=ev.pressure;s.firstWasMissingPressure=false;
+        pts[0][2]=measuredPressure;s.firstWasMissingPressure=false;
       }
-      if(origin[2]>ev.pressure*PEN_TIP_SPIKE_RATIO
-          && origin[2]-ev.pressure>=PEN_TIP_SPIKE_DROP){
+      if(origin[2]>measuredPressure*PEN_TIP_SPIKE_RATIO
+          && origin[2]-measuredPressure>=PEN_TIP_SPIKE_DROP){
         for(const q of pts){
           if(Math.hypot(q[0]-origin[0],q[1]-origin[1])<=PEN_TIP_CORRECTION_DISTANCE){
-            q[2]=Math.min(q[2],ev.pressure);
+            q[2]=Math.min(q[2],measuredPressure);
           }
         }
       }
@@ -175,7 +183,7 @@ function addPenSample(s,ev){
   }
   // Ignore sub-pixel sampling jitter, but retain genuine travel.
   if(d<Math.max(.25,.25/Math.max(.2,state.zoom)))return;
-  const raw=samplePressure(ev,prev[2]);
+  const raw=measuredPressure;
   const alpha=1-Math.exp(-d/PRESSURE_SMOOTH_DISTANCE);
   const wanted=prev[2]+(raw-prev[2])*alpha;
   // A narrow spike in a sample cannot increase width by dozens of pixels.
