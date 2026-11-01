@@ -1,4 +1,4 @@
-/* Caihua iPad annotator V3.1.3 gentle pressure tuning, original V1.2 Smooth: private photos + stroke JSON live in iPad IndexedDB.
+/* Caihua iPad annotator V3.1.4 light pressure tuning, original V1.2 Smooth: private photos + stroke JSON live in iPad IndexedDB.
    Legacy strokes retain upstream ribbon geometry; new strokes use versioned round-dabs-v2.
    1–45 image px: radius = 0.5 + 22*filtered_pressure. */
 'use strict';
@@ -107,19 +107,25 @@ const SMOOTH_RENDERER='round-dabs-v2';
 const PRESSURE_SMOOTH_DISTANCE=5; // original image px; damping isolated spikes
 // On iPad Safari, the first pen pointerdown may have pressure 0 (unreported).
 // Do not invent 0.5 (=23px wide!) for a very light touch. This is only used
-// when the initial Apple Pencil pressure is missing; the usual 1..45px mapping
-// and the round-dabs-v2 renderer remain unchanged.
-const PEN_MISSING_START_PRESSURE=.02;
+// when the initial Apple Pencil pressure is missing. Start at the 1px minimum
+// so an unreported sample cannot be thicker than a subsequent light touch.
+const PEN_MISSING_START_PRESSURE=0;
 const PEN_TIP_CORRECTION_DISTANCE=7; // source-image pixels, not display pixels
 const PEN_TIP_SPIKE_RATIO=1.8;
 const PEN_TIP_SPIKE_DROP=.05;
-// Very small Apple Pencil-only sensitivity adjustment: 0 and 1 stay fixed.
-// 1.06 means an approx. 0.9px narrower width at mid-pressure, with the
-// original 1..45px full range and the round-dabs-v2 JSON format unchanged.
+// Retain V3.1.3's curve at medium/heavy pressure. Below raw pressure .30,
+// smoothly reduce only NEW pen samples: .10 -> 1.26px, .15 -> 2.47px.
+// Store the mapped/filtered value as before; never remap saved pressures in
+// roundDabs (the Mac exporter must still use radius = .5 + 22*stored_pressure).
 const PEN_PRESSURE_CURVE=1.06;
-function samplePressure(e,fallback=.5){
+const PEN_LIGHT_PRESSURE_LIMIT=.30;
+function samplePressure(e,fallback=e.pointerType==='pen'?PEN_MISSING_START_PRESSURE:.5){
   if(!(Number.isFinite(e.pressure)&&e.pressure>0&&e.pressure<=1))return fallback;
-  return e.pointerType==='pen'?Math.pow(e.pressure,PEN_PRESSURE_CURVE):e.pressure;
+  if(e.pointerType!=='pen')return e.pressure;
+  const mapped=Math.pow(e.pressure,PEN_PRESSURE_CURVE);
+  const t=Math.min(1,e.pressure/PEN_LIGHT_PRESSURE_LIMIT);
+  const gain=t*t*(3-2*t); // smoothstep: continuous slope at the legacy boundary
+  return mapped*gain*gain;
 }
 function roundDabs(pts,cb){
   if(!pts?.length)return;
@@ -165,12 +171,16 @@ function addPenSample(s,ev){
   if(s.penStart&&validPressure){
     const origin=pts[0];
     const fromStart=Math.hypot(p.x-origin[0],p.y-origin[1]);
-    if(fromStart<=PEN_TIP_CORRECTION_DISTANCE){
+    // Also correct the first segment when a fast move skips the 7px window.
+    if(fromStart<=PEN_TIP_CORRECTION_DISTANCE||pts.length===1){
       if(pts.length===1&&s.firstWasMissingPressure){
         pts[0][2]=measuredPressure;s.firstWasMissingPressure=false;
       }
+      // At hairline widths a .05 drop already means 2.2px: use a smaller
+      // threshold there, while retaining V3.1.3's medium/heavy tip correction.
+      const spikeDrop=Math.min(PEN_TIP_SPIKE_DROP,Math.max(.005,measuredPressure));
       if(origin[2]>measuredPressure*PEN_TIP_SPIKE_RATIO
-          && origin[2]-measuredPressure>=PEN_TIP_SPIKE_DROP){
+          && origin[2]-measuredPressure>=spikeDrop){
         for(const q of pts){
           if(Math.hypot(q[0]-origin[0],q[1]-origin[1])<=PEN_TIP_CORRECTION_DISTANCE){
             q[2]=Math.min(q[2],measuredPressure);
